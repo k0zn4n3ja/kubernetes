@@ -96,6 +96,8 @@ type managerImpl struct {
 	signalToNodeReclaimFuncs map[evictionapi.Signal]nodeReclaimFuncs
 	// last observations from synchronize
 	lastObservations signalObservations
+	// last summary from synchronize, used to measure memory stalls between observations
+	lastSummary *statsapi.Summary
 	// dedicatedImageFs indicates if imagefs is on a separate device from the rootfs
 	dedicatedImageFs *bool
 	// splitContainerImageFs indicates if containerfs is on a separate device from imagefs
@@ -316,7 +318,7 @@ func (m *managerImpl) synchronize(ctx context.Context, diskInfoProvider DiskInfo
 	}
 
 	// make observations and get a function to derive pod usage stats relative to those observations.
-	observations, statsFunc := makeSignalObservations(logger, summary)
+	observations, statsFunc := makeSignalObservations(logger, summary, m.lastSummary)
 	debugLogObservations(logger, "observations", observations)
 
 	// determine the set of thresholds met independent of grace period
@@ -365,6 +367,7 @@ func (m *managerImpl) synchronize(ctx context.Context, diskInfoProvider DiskInfo
 	debugLogThresholdsWithObservation(logger, "thresholds - updated stats", thresholds, observations)
 
 	m.lastObservations = observations
+	m.lastSummary = summary
 	m.Unlock()
 
 	// evict pods if there is a resource usage violation from local volume temporary storage
@@ -496,7 +499,7 @@ func (m *managerImpl) reclaimNodeLevelResources(ctx context.Context, signalToRec
 		}
 
 		// make observations and get a function to derive pod usage stats relative to those observations.
-		observations, _ := makeSignalObservations(logger, summary)
+		observations, _ := makeSignalObservations(logger, summary, m.lastSummary)
 		debugLogObservations(logger, "observations after resource reclaim", observations)
 
 		// evaluate all thresholds independently of their grace period to see if with

@@ -919,6 +919,14 @@ const (
 	// bursting into resources requested at higher QoS levels (memory only for now)
 	QOSReserved featuregate.Feature = "QOSReserved"
 
+	// owner: TBD
+	// kep: TBD (proposed in kubernetes/kubernetes#43916)
+	//
+	// Counts reclaimable active file page cache as available memory when computing the
+	// memory.available and allocatableMemory.available eviction signals on cgroup v2,
+	// scaling the credit down to zero as memory pressure stall information (PSI) rises.
+	ReclaimAwareMemoryEviction featuregate.Feature = "ReclaimAwareMemoryEviction"
+
 	// owner: @gnufied
 	// kep: https://kep.k8s.io/1790
 	//
@@ -1896,6 +1904,10 @@ var defaultVersionedKubernetesFeatureGates = map[featuregate.Feature]featuregate
 		{Version: version.MustParse("1.11"), Default: false, PreRelease: featuregate.Alpha},
 	},
 
+	ReclaimAwareMemoryEviction: {
+		{Version: version.MustParse("1.38"), Default: false, PreRelease: featuregate.Alpha},
+	},
+
 	RecoverVolumeExpansionFailure: {
 		{Version: version.MustParse("1.23"), Default: false, PreRelease: featuregate.Alpha},
 		{Version: version.MustParse("1.32"), Default: true, PreRelease: featuregate.Beta},
@@ -2632,6 +2644,8 @@ var defaultKubernetesFeatureGateDependencies = map[featuregate.Feature][]feature
 	ProcMountType: {UserNamespacesSupport},
 
 	QOSReserved: {},
+
+	ReclaimAwareMemoryEviction: {KubeletPSI},
 
 	RecoverVolumeExpansionFailure: {},
 

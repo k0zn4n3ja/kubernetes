@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	goruntime "runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -39,6 +40,7 @@ import (
 	"k8s.io/kubernetes/pkg/features"
 	evictionapi "k8s.io/kubernetes/pkg/kubelet/eviction/api"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
+	"k8s.io/utils/ptr"
 )
 
 func quantityMustParse(value string) *resource.Quantity {
@@ -1459,7 +1461,7 @@ func TestMakeSignalObservations(t *testing.T) {
 	if res.CmpInt64(int64(allocatableMemoryCapacity)) != 0 {
 		t.Errorf("Expected Threshold %v to be equal to value %v", res.Value(), allocatableMemoryCapacity)
 	}
-	actualObservations, statsFunc := makeSignalObservations(logger, fakeStats)
+	actualObservations, statsFunc := makeSignalObservations(logger, fakeStats, nil)
 	allocatableMemQuantity, found := actualObservations[evictionapi.SignalAllocatableMemoryAvailable]
 	if !found {
 		t.Errorf("Expected allocatable memory observation, but didn't find one")
@@ -3718,6 +3720,181 @@ func TestEvictionMessage(t *testing.T) {
 					t.Errorf("Unexpected annotation value for %s key found, got: %s, want: %s", key, val, tc.expectedAnnotations[key])
 				}
 			}
+		})
+	}
+}
+
+func TestReclaimableFileCacheBytes(t *testing.T) {
+	gi := uint64(1024 * 1024 * 1024)
+	mi := uint64(1024 * 1024)
+	memory := func(workingSet, activeFile, dirty, writeback uint64, psiSomeAvg10 float64) *statsapi.MemoryStats {
+		return &statsapi.MemoryStats{
+			WorkingSetBytes:    &workingSet,
+			ActiveFileBytes:    &activeFile,
+			FileDirtyBytes:     &dirty,
+			FileWritebackBytes: &writeback,
+			PSI:                &statsapi.PSIStats{Some: statsapi.PSIData{Avg10: psiSomeAvg10}},
+		}
+	}
+	testCases := map[string]struct {
+		featureEnabled bool
+		memory         *statsapi.MemoryStats
+		expected       uint64
+	}{
+		"feature disabled": {
+			memory:   memory(4*gi, 2*gi, 0, 0, 0),
+			expected: 0,
+		},
+		"no memory pressure credits all clean active file cache": {
+			featureEnabled: true,
+			memory:         memory(4*gi, 2*gi, 0, 0, 0),
+			expected:       2 * gi,
+		},
+		"dirty and writeback pages are not credited": {
+			featureEnabled: true,
+			memory:         memory(4*gi, 2*gi, 512*mi, 512*mi, 0),
+			expected:       1 * gi,
+		},
+		"credit scales down linearly with memory pressure": {
+			featureEnabled: true,
+			memory:         memory(4*gi, 2*gi, 0, 0, reclaimableCachePSICeiling/4),
+			expected:       3 * gi / 2,
+		},
+		"memory pressure at the ceiling removes the credit": {
+			featureEnabled: true,
+			memory:         memory(4*gi, 2*gi, 0, 0, reclaimableCachePSICeiling),
+			expected:       0,
+		},
+		"memory pressure above the ceiling removes the credit": {
+			featureEnabled: true,
+			memory:         memory(4*gi, 2*gi, 0, 0, 3*reclaimableCachePSICeiling),
+			expected:       0,
+		},
+		"dirty pages exceeding active file cache give no credit": {
+			featureEnabled: true,
+			memory:         memory(4*gi, 1*gi, 1*gi, 512*mi, 0),
+			expected:       0,
+		},
+		"credit never exceeds the working set": {
+			featureEnabled: true,
+			memory:         memory(1*gi, 2*gi, 0, 0, 0),
+			expected:       1 * gi,
+		},
+		"missing PSI gives no credit": {
+			featureEnabled: true,
+			memory: &statsapi.MemoryStats{
+				WorkingSetBytes: &gi,
+				ActiveFileBytes: &gi,
+			},
+			expected: 0,
+		},
+		"missing active file counter gives no credit": {
+			featureEnabled: true,
+			memory: &statsapi.MemoryStats{
+				WorkingSetBytes: &gi,
+				PSI:             &statsapi.PSIStats{},
+			},
+			expected: 0,
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ReclaimAwareMemoryEviction, tc.featureEnabled)
+			if actual := reclaimableFileCacheBytes(tc.memory, nil); actual != tc.expected {
+				t.Errorf("expected %d, got %d", tc.expected, actual)
+			}
+		})
+	}
+}
+
+func TestMakeSignalObservationsReclaimableFileCache(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("memory.available is derived from commit charge on Windows")
+	}
+	logger, _ := ktesting.NewTestContext(t)
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ReclaimAwareMemoryEviction, true)
+	gi := uint64(1024 * 1024 * 1024)
+	memory := func(available, workingSet, activeFile uint64) *statsapi.MemoryStats {
+		return &statsapi.MemoryStats{
+			AvailableBytes:     &available,
+			WorkingSetBytes:    &workingSet,
+			ActiveFileBytes:    &activeFile,
+			FileDirtyBytes:     ptr.To[uint64](0),
+			FileWritebackBytes: ptr.To[uint64](0),
+			PSI:                &statsapi.PSIStats{},
+		}
+	}
+	summary := &statsapi.Summary{
+		Node: statsapi.NodeStats{
+			Memory: memory(1*gi, 7*gi, 3*gi),
+			SystemContainers: []statsapi.ContainerStats{
+				{Name: statsapi.SystemContainerPods, Memory: memory(1*gi, 5*gi, 2*gi)},
+			},
+		},
+	}
+	observations, _ := makeSignalObservations(logger, summary, nil)
+	for signal, expected := range map[evictionapi.Signal]struct{ available, capacity uint64 }{
+		evictionapi.SignalMemoryAvailable:            {available: 4 * gi, capacity: 8 * gi},
+		evictionapi.SignalAllocatableMemoryAvailable: {available: 3 * gi, capacity: 6 * gi},
+	} {
+		observation, found := observations[signal]
+		if !found {
+			t.Fatalf("expected an observation for %v", signal)
+		}
+		if actual := uint64(observation.available.Value()); actual != expected.available {
+			t.Errorf("%v: expected available %d, got %d", signal, expected.available, actual)
+		}
+		if actual := uint64(observation.capacity.Value()); actual != expected.capacity {
+			t.Errorf("%v: expected capacity %d, got %d", signal, expected.capacity, actual)
+		}
+	}
+}
+
+func TestMemoryStallPercent(t *testing.T) {
+	now := time.Now()
+	sample := func(at time.Time, avg10 float64, totalMicroseconds uint64) *statsapi.MemoryStats {
+		return &statsapi.MemoryStats{
+			Time: metav1.NewTime(at),
+			PSI:  &statsapi.PSIStats{Some: statsapi.PSIData{Avg10: avg10, Total: totalMicroseconds}},
+		}
+	}
+	testCases := map[string]struct {
+		current, previous *statsapi.MemoryStats
+		expected          float64
+	}{
+		"no previous sample uses avg10": {
+			current:  sample(now, 1.5, 9_000_000),
+			expected: 1.5,
+		},
+		"stall rate above a truncated avg10 wins": {
+			current:  sample(now, 0, 1_300_000),
+			previous: sample(now.Add(-10*time.Second), 0, 1_000_000),
+			expected: 3,
+		},
+		"avg10 above the stall rate wins": {
+			current:  sample(now, 4, 1_100_000),
+			previous: sample(now.Add(-10*time.Second), 0, 1_000_000),
+			expected: 4,
+		},
+		"counter reset falls back to avg10": {
+			current:  sample(now, 0.5, 100),
+			previous: sample(now.Add(-10*time.Second), 0, 1_000_000),
+			expected: 0.5,
+		},
+		"window under a second falls back to avg10": {
+			current:  sample(now, 0.5, 2_000_000),
+			previous: sample(now.Add(-500*time.Millisecond), 0, 1_000_000),
+			expected: 0.5,
+		},
+		"previous sample without PSI falls back to avg10": {
+			current:  sample(now, 0.5, 2_000_000),
+			previous: &statsapi.MemoryStats{Time: metav1.NewTime(now.Add(-10 * time.Second))},
+			expected: 0.5,
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			assert.InDelta(t, tc.expected, memoryStallPercent(tc.current, tc.previous), 1e-9)
 		})
 	}
 }

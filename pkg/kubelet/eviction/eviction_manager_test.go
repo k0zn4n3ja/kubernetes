@@ -3296,3 +3296,191 @@ func TestContainerEphemeralStorageLimitEvictionForRestartableInitContainers(t *t
 		t.Fatalf("Expected evicted pod %q, got %v", pod.Name, evictedPods)
 	}
 }
+
+func TestMemoryPressureReclaimableFileCache(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("memory.available is derived from commit charge on Windows")
+	}
+	// A 4Gi node with 3.5Gi in the working set, 2Gi of which is active file cache.
+	makeSummary := func(podStats map[*v1.Pod]statsapi.PodStats, dirty uint64, psi *statsapi.PSIStats) *statsapi.Summary {
+		memory := func() *statsapi.MemoryStats {
+			return &statsapi.MemoryStats{
+				AvailableBytes:     ptr.To[uint64](512 * 1024 * 1024),
+				WorkingSetBytes:    ptr.To[uint64](3584 * 1024 * 1024),
+				ActiveFileBytes:    ptr.To[uint64](2048 * 1024 * 1024),
+				FileDirtyBytes:     ptr.To(dirty),
+				FileWritebackBytes: ptr.To[uint64](0),
+				PSI:                psi,
+			}
+		}
+		summary := &statsapi.Summary{
+			Node: statsapi.NodeStats{
+				Memory:           memory(),
+				SystemContainers: []statsapi.ContainerStats{{Name: statsapi.SystemContainerPods, Memory: memory()}},
+			},
+		}
+		for _, podStat := range podStats {
+			summary.Pods = append(summary.Pods, podStat)
+		}
+		return summary
+	}
+	psi := func(someAvg10 float64) *statsapi.PSIStats {
+		return &statsapi.PSIStats{Some: statsapi.PSIData{Avg10: someAvg10}}
+	}
+	testCases := map[string]struct {
+		featureEnabled bool
+		dirty          uint64
+		psi            *statsapi.PSIStats
+		expectEviction bool
+	}{
+		"feature disabled evicts on page cache": {
+			psi:            psi(0),
+			expectEviction: true,
+		},
+		"no memory pressure counts the cache as available": {
+			featureEnabled: true,
+			psi:            psi(0),
+			expectEviction: false,
+		},
+		"light memory pressure keeps most of the credit": {
+			featureEnabled: true,
+			psi:            psi(reclaimableCachePSICeiling / 5),
+			expectEviction: false,
+		},
+		"memory pressure at the ceiling evicts as before": {
+			featureEnabled: true,
+			psi:            psi(reclaimableCachePSICeiling),
+			expectEviction: true,
+		},
+		"dirty cache is not credited": {
+			featureEnabled: true,
+			dirty:          1800 * 1024 * 1024,
+			psi:            psi(0),
+			expectEviction: true,
+		},
+		"missing PSI evicts as before": {
+			featureEnabled: true,
+			expectEviction: true,
+		},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ReclaimAwareMemoryEviction, tc.featureEnabled)
+			tCtx := ktesting.Init(t)
+			pod, podStat := makePodWithMemoryStats("best-effort", defaultPriority, newResourceList("", "", ""), newResourceList("", "", ""), "1Gi")
+			pods := []*v1.Pod{pod}
+			podKiller := &mockPodKiller{}
+			diskGC := &mockDiskGC{err: nil}
+			manager := &managerImpl{
+				clock:       testingclock.NewFakeClock(time.Now()),
+				killPodFunc: podKiller.killPodNow,
+				imageGC:     diskGC,
+				containerGC: diskGC,
+				config: Config{
+					MaxPodGracePeriodSeconds: 5,
+					PressureTransitionPeriod: time.Minute * 5,
+					Thresholds: []evictionapi.Threshold{{
+						Signal:   evictionapi.SignalMemoryAvailable,
+						Operator: evictionapi.OpLessThan,
+						Value:    evictionapi.ThresholdValue{Quantity: quantityMustParse("1Gi")},
+					}},
+				},
+				recorder:                     &record.FakeRecorder{},
+				summaryProvider:              &fakeSummaryProvider{result: makeSummary(map[*v1.Pod]statsapi.PodStats{pod: podStat}, tc.dirty, tc.psi)},
+				nodeRef:                      &v1.ObjectReference{Kind: "Node", Name: "test", UID: types.UID("test")},
+				nodeConditionsLastObservedAt: nodeConditionsObservedAt{},
+				thresholdsFirstObservedAt:    thresholdsObservedAt{},
+			}
+			if _, err := manager.synchronize(tCtx, &mockDiskInfoProvider{dedicatedImageFs: ptr.To(false)}, func() []*v1.Pod { return pods }); err != nil {
+				t.Fatalf("Manager expects no error but got %v", err)
+			}
+			if evicted := podKiller.pod != nil; evicted != tc.expectEviction {
+				t.Errorf("expected eviction %v, got %v", tc.expectEviction, evicted)
+			}
+			if pressure := manager.IsUnderMemoryPressure(); pressure != tc.expectEviction {
+				t.Errorf("expected memory pressure %v, got %v", tc.expectEviction, pressure)
+			}
+		})
+	}
+}
+
+func TestMemoryPressureReclaimableFileCacheStallRate(t *testing.T) {
+	if goruntime.GOOS == "windows" {
+		t.Skip("memory.available is derived from commit charge on Windows")
+	}
+	featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ReclaimAwareMemoryEviction, true)
+	// avg10 stays at zero throughout, as it does for steady stalls below one percent per period.
+	makeSummary := func(at time.Time, stallTotalMicroseconds uint64, pod *v1.Pod, podStat statsapi.PodStats) *statsapi.Summary {
+		memory := func() *statsapi.MemoryStats {
+			return &statsapi.MemoryStats{
+				Time:               metav1.NewTime(at),
+				AvailableBytes:     ptr.To[uint64](512 * 1024 * 1024),
+				WorkingSetBytes:    ptr.To[uint64](3584 * 1024 * 1024),
+				ActiveFileBytes:    ptr.To[uint64](2048 * 1024 * 1024),
+				FileDirtyBytes:     ptr.To[uint64](0),
+				FileWritebackBytes: ptr.To[uint64](0),
+				PSI:                &statsapi.PSIStats{Some: statsapi.PSIData{Total: stallTotalMicroseconds}},
+			}
+		}
+		return &statsapi.Summary{
+			Node: statsapi.NodeStats{
+				Memory:           memory(),
+				SystemContainers: []statsapi.ContainerStats{{Name: statsapi.SystemContainerPods, Memory: memory()}},
+			},
+			Pods: []statsapi.PodStats{podStat},
+		}
+	}
+	testCases := map[string]struct {
+		stallMicroseconds uint64
+		expectEviction    bool
+	}{
+		"stalls at 0.2% of the window keep most of the credit": {stallMicroseconds: 20_000, expectEviction: false},
+		"stalls at 3% of the window remove the credit":         {stallMicroseconds: 300_000, expectEviction: true},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			tCtx := ktesting.Init(t)
+			pod, podStat := makePodWithMemoryStats("best-effort", defaultPriority, newResourceList("", "", ""), newResourceList("", "", ""), "1Gi")
+			pods := []*v1.Pod{pod}
+			podKiller := &mockPodKiller{}
+			diskGC := &mockDiskGC{err: nil}
+			fakeClock := testingclock.NewFakeClock(time.Now())
+			summaryProvider := &fakeSummaryProvider{result: makeSummary(fakeClock.Now(), 5_000_000, pod, podStat)}
+			manager := &managerImpl{
+				clock:       fakeClock,
+				killPodFunc: podKiller.killPodNow,
+				imageGC:     diskGC,
+				containerGC: diskGC,
+				config: Config{
+					MaxPodGracePeriodSeconds: 5,
+					PressureTransitionPeriod: time.Minute * 5,
+					Thresholds: []evictionapi.Threshold{{
+						Signal:   evictionapi.SignalMemoryAvailable,
+						Operator: evictionapi.OpLessThan,
+						Value:    evictionapi.ThresholdValue{Quantity: quantityMustParse("1Gi")},
+					}},
+				},
+				recorder:                     &record.FakeRecorder{},
+				summaryProvider:              summaryProvider,
+				nodeRef:                      &v1.ObjectReference{Kind: "Node", Name: "test", UID: types.UID("test")},
+				nodeConditionsLastObservedAt: nodeConditionsObservedAt{},
+				thresholdsFirstObservedAt:    thresholdsObservedAt{},
+			}
+			synchronize := func() {
+				if _, err := manager.synchronize(tCtx, &mockDiskInfoProvider{dedicatedImageFs: ptr.To(false)}, func() []*v1.Pod { return pods }); err != nil {
+					t.Fatalf("Manager expects no error but got %v", err)
+				}
+			}
+			synchronize()
+			if podKiller.pod != nil {
+				t.Fatalf("expected no eviction before any stall was measured, evicted %v", podKiller.pod.Name)
+			}
+			fakeClock.Step(10 * time.Second)
+			summaryProvider.result = makeSummary(fakeClock.Now(), 5_000_000+tc.stallMicroseconds, pod, podStat)
+			synchronize()
+			if evicted := podKiller.pod != nil; evicted != tc.expectEviction {
+				t.Errorf("expected eviction %v, got %v", tc.expectEviction, evicted)
+			}
+		})
+	}
+}

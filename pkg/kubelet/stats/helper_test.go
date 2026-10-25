@@ -27,8 +27,11 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/sets"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	"k8s.io/ktesting"
 	statsapi "k8s.io/kubelet/pkg/apis/stats/v1alpha1"
+	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/utils/ptr"
 )
 
@@ -176,4 +179,45 @@ func TestCadvisorPSIStructs(t *testing.T) {
 		}
 	}
 
+}
+
+func TestCadvisorInfoToMemoryStatsFileCache(t *testing.T) {
+	info := &cadvisorapi.ContainerInfo{
+		Spec: cadvisorapi.ContainerSpec{HasMemory: true, Memory: cadvisorapi.MemorySpec{Limit: 8 << 30}},
+		Stats: []*cadvisorapi.ContainerStats{{
+			Timestamp: time.Now(),
+			Memory: &cadvisorapi.MemoryStats{
+				Usage:           6 << 30,
+				WorkingSet:      5 << 30,
+				TotalActiveFile: 3 << 30,
+				FileDirty:       1 << 20,
+				FileWriteback:   2 << 20,
+			},
+		}},
+	}
+	populated := [3]*uint64{ptr.To[uint64](3 << 30), ptr.To[uint64](1 << 20), ptr.To[uint64](2 << 20)}
+	testCases := map[string]struct {
+		featureEnabled bool
+		cgroup2        bool
+		psiAvailable   bool
+		expected       [3]*uint64
+	}{
+		"feature disabled":   {cgroup2: true, psiAvailable: true},
+		"cgroup v1":          {featureEnabled: true, psiAvailable: true},
+		"PSI unavailable":    {featureEnabled: true, cgroup2: true},
+		"cgroup v2 with PSI": {featureEnabled: true, cgroup2: true, psiAvailable: true, expected: populated},
+	}
+	for name, tc := range testCases {
+		t.Run(name, func(t *testing.T) {
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.ReclaimAwareMemoryEviction, tc.featureEnabled)
+			origCgroup2, origPSI := isCgroup2UnifiedMode, memoryPSIAvailable
+			t.Cleanup(func() { isCgroup2UnifiedMode, memoryPSIAvailable = origCgroup2, origPSI })
+			isCgroup2UnifiedMode = func() bool { return tc.cgroup2 }
+			memoryPSIAvailable = func() bool { return tc.psiAvailable }
+
+			_, memory := cadvisorInfoToCPUandMemoryStats(info)
+			assert.Equal(t, tc.expected, [3]*uint64{memory.ActiveFileBytes, memory.FileDirtyBytes, memory.FileWritebackBytes})
+			assert.Equal(t, uint64(3<<30), *memory.AvailableBytes, "AvailableBytes must keep its working set definition")
+		})
+	}
 }

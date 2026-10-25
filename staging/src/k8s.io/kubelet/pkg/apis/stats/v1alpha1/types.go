@@ -267,6 +267,18 @@ type MemoryStats struct {
 	// Memory PSI stats.
 	// +optional
 	PSI *PSIStats `json:"psi,omitempty"`
+	// The amount of file-backed page cache on the active LRU list.
+	// Reported only on cgroup v2 hosts with the ReclaimAwareMemoryEviction feature gate enabled.
+	// +optional
+	ActiveFileBytes *uint64 `json:"activeFileBytes,omitempty"`
+	// The amount of file-backed page cache that is dirty and not yet written back.
+	// Reported only on cgroup v2 hosts with the ReclaimAwareMemoryEviction feature gate enabled.
+	// +optional
+	FileDirtyBytes *uint64 `json:"fileDirtyBytes,omitempty"`
+	// The amount of file-backed page cache that is under writeback.
+	// Reported only on cgroup v2 hosts with the ReclaimAwareMemoryEviction feature gate enabled.
+	// +optional
+	FileWritebackBytes *uint64 `json:"fileWritebackBytes,omitempty"`
 }
 
 // IOStats contains data about IO usage.
