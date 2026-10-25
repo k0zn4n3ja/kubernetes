@@ -182,7 +182,12 @@ func isPsiEnabled(logger klog.Logger, cgroupDir, psiFile string) bool {
 		logger.V(4).Info("PSI not available", "dir", cgroupDir, "file", psiFile, "err", err)
 		return false
 	}
-	_ = f.Close()
+	defer func() { _ = f.Close() }()
+	// Kernels built with CONFIG_PSI_DEFAULT_DISABLED keep the file but fail reads without psi=1.
+	if _, err := f.Read(make([]byte, 1)); err != nil {
+		logger.V(4).Info("PSI not available", "dir", cgroupDir, "file", psiFile, "err", err)
+		return false
+	}
 	return true
 }
 

@@ -37,6 +37,7 @@ func TestIsPsiEnabled(t *testing.T) {
 	testcases := []struct {
 		description   string
 		createPSIFile bool
+		unreadablePSI bool
 		expected      bool
 	}{{
 		description:   "PSI enabled when cgroup pressure file exists",
@@ -45,6 +46,10 @@ func TestIsPsiEnabled(t *testing.T) {
 	}, {
 		description:   "PSI disabled when cgroup pressure file does not exist",
 		createPSIFile: false,
+		expected:      false,
+	}, {
+		description:   "PSI disabled when cgroup pressure file exists but cannot be read",
+		unreadablePSI: true,
 		expected:      false,
 	}}
 
@@ -58,6 +63,10 @@ func TestIsPsiEnabled(t *testing.T) {
 			if tc.createPSIFile {
 				err := os.WriteFile(filepath.Join(tmpDir, "cpu.pressure"), []byte("some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n"), 0644)
 				require.NoError(t, err)
+			}
+			if tc.unreadablePSI {
+				// A directory opens like the kernel's file does when psi=1 is missing, then fails on read.
+				require.NoError(t, os.Mkdir(filepath.Join(tmpDir, "cpu.pressure"), 0755))
 			}
 
 			result := isPsiEnabled(klog.Background(), tmpDir, "cpu.pressure")
