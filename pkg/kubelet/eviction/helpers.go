@@ -36,6 +36,7 @@ import (
 	evictionapi "k8s.io/kubernetes/pkg/kubelet/eviction/api"
 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
 	volumeutils "k8s.io/kubernetes/pkg/volume/util"
+	"k8s.io/utils/ptr"
 )
 
 const (
@@ -844,14 +845,74 @@ func (a byEvictionPriority) Less(i, j int) bool {
 	return a[i].Signal == evictionapi.SignalMemoryAvailable || a[i].Signal == evictionapi.SignalAllocatableMemoryAvailable || !jSignalHasResource
 }
 
-// makeSignalObservations derives observations using the specified summary provider.
-func makeSignalObservations(logger klog.Logger, summary *statsapi.Summary) (signalObservations, statsFunc) {
+// reclaimableCachePSICeiling is the memory stall percentage at which active file cache stops
+// counting as available memory.
+const reclaimableCachePSICeiling = 2.0
+
+// memoryStallPercent returns the share of time in which some task stalled on memory: the larger
+// of the kernel's avg10 and the rate since the previous sample. avg10 truncates each two-second
+// period to whole percent, so it reads zero for the light, steady stalls of early thrashing.
+func memoryStallPercent(current, previous *statsapi.MemoryStats) float64 {
+	stall := current.PSI.Some.Avg10
+	if previous == nil || previous.PSI == nil || current.PSI.Some.Total < previous.PSI.Some.Total {
+		return stall
+	}
+	elapsed := current.Time.Sub(previous.Time.Time)
+	if elapsed < time.Second {
+		return stall
+	}
+	// The kernel, and so the Summary API, reports PSI totals in microseconds.
+	rate := float64(current.PSI.Some.Total-previous.PSI.Some.Total) / float64(elapsed.Microseconds()) * 100
+	return max(stall, rate)
+}
+
+// reclaimableFileCacheBytes returns the clean active file cache in memory, scaled linearly from
+// all of it when no task stalls on memory down to none at reclaimableCachePSICeiling. The working
+// set counts that cache as used even though the kernel reclaims it before invoking the OOM killer;
+// memory stalls show when reclaiming it is no longer cheap, at which point the signal falls back to
+// the working set alone. previous is the same cgroup's stats from the last synchronize, if any. It
+// returns zero unless ReclaimAwareMemoryEviction is enabled and the stats carry both the file cache
+// counters and PSI.
+func reclaimableFileCacheBytes(memory, previous *statsapi.MemoryStats) uint64 {
+	if !utilfeature.DefaultFeatureGate.Enabled(features.ReclaimAwareMemoryEviction) {
+		return 0
+	}
+	if memory.ActiveFileBytes == nil || memory.PSI == nil || memory.WorkingSetBytes == nil {
+		return 0
+	}
+	busy := ptr.Deref(memory.FileDirtyBytes, 0) + ptr.Deref(memory.FileWritebackBytes, 0)
+	clean := min(*memory.ActiveFileBytes, *memory.WorkingSetBytes)
+	if busy >= clean {
+		return 0
+	}
+	scale := 1 - memoryStallPercent(memory, previous)/reclaimableCachePSICeiling
+	if scale <= 0 {
+		return 0
+	}
+	return uint64(float64(clean-busy) * min(scale, 1))
+}
+
+// systemContainerMemory returns the memory stats of the named system container, or nil.
+func systemContainerMemory(summary *statsapi.Summary, name string) *statsapi.MemoryStats {
+	if summary == nil {
+		return nil
+	}
+	container, err := getSysContainer(summary.Node.SystemContainers, name)
+	if err != nil {
+		return nil
+	}
+	return container.Memory
+}
+
+// makeSignalObservations derives observations using the specified summary provider. previous is
+// the summary from the last synchronize, or nil.
+func makeSignalObservations(logger klog.Logger, summary, previous *statsapi.Summary) (signalObservations, statsFunc) {
 	// build the function to work against for pod stats
 	statsFunc := cachedStatsFunc(summary.Pods)
 	// build an evaluation context for current eviction signals
 	result := signalObservations{}
 
-	memoryAvailableSignal := makeMemoryAvailableSignalObservation(logger, summary)
+	memoryAvailableSignal := makeMemoryAvailableSignalObservation(logger, summary, previous)
 	if memoryAvailableSignal != nil {
 		result[evictionapi.SignalMemoryAvailable] = *memoryAvailableSignal
 	}
@@ -861,7 +922,7 @@ func makeSignalObservations(logger klog.Logger, summary *statsapi.Summary) (sign
 	} else {
 		if memory := allocatableContainer.Memory; memory != nil && memory.AvailableBytes != nil && memory.WorkingSetBytes != nil {
 			result[evictionapi.SignalAllocatableMemoryAvailable] = signalObservation{
-				available: resource.NewQuantity(int64(*memory.AvailableBytes), resource.BinarySI),
+				available: resource.NewQuantity(int64(*memory.AvailableBytes+reclaimableFileCacheBytes(memory, systemContainerMemory(previous, statsapi.SystemContainerPods))), resource.BinarySI),
 				capacity:  resource.NewQuantity(int64(*memory.AvailableBytes+*memory.WorkingSetBytes), resource.BinarySI),
 				time:      memory.Time,
 			}

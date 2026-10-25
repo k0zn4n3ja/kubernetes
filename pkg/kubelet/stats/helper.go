@@ -18,6 +18,7 @@ package stats
 
 import (
 	"fmt"
+	"sync"
 	"time"
 
 	cadvisorapi "github.com/google/cadvisor/lib/model"
@@ -29,6 +30,7 @@ import (
 	"k8s.io/kubernetes/pkg/features"
 	"k8s.io/kubernetes/pkg/kubelet/cadvisor"
 	"k8s.io/kubernetes/pkg/kubelet/server/stats"
+	kubeletutil "k8s.io/kubernetes/pkg/kubelet/util"
 	"k8s.io/utils/ptr"
 )
 
@@ -36,6 +38,13 @@ import (
 // This logic relies on knowledge of the container runtime implementation and
 // is not reliable.
 const defaultNetworkInterfaceName = "eth0"
+
+// Host probes for the file cache counters; variables so tests can pin both outcomes.
+var (
+	isCgroup2UnifiedMode = kubeletutil.IsCgroup2UnifiedMode
+	// cAdvisor reports PSI as zeros rather than absent when the host does not track pressure.
+	memoryPSIAvailable = sync.OnceValue(func() bool { return cadvisor.IsPsiEnabled(klog.TODO()) })
+)
 
 func cadvisorInfoToCPUandMemoryStats(info *cadvisorapi.ContainerInfo) (*statsapi.CPUStats, *statsapi.MemoryStats) {
 	cstat, found := latestContainerStats(info)
@@ -78,6 +87,12 @@ func cadvisorInfoToCPUandMemoryStats(info *cadvisorapi.ContainerInfo) (*statsapi
 		}
 		if utilfeature.DefaultFeatureGate.Enabled(features.KubeletPSI) {
 			memoryStats.PSI = cadvisorPSIToStatsPSI(&cstat.Memory.PSI)
+		}
+		// The eviction manager trusts these counters only alongside PSI.
+		if utilfeature.DefaultFeatureGate.Enabled(features.ReclaimAwareMemoryEviction) && isCgroup2UnifiedMode() && memoryPSIAvailable() {
+			memoryStats.ActiveFileBytes = ptr.To(cstat.Memory.TotalActiveFile)
+			memoryStats.FileDirtyBytes = ptr.To(cstat.Memory.FileDirty)
+			memoryStats.FileWritebackBytes = ptr.To(cstat.Memory.FileWriteback)
 		}
 	} else {
 		memoryStats = &statsapi.MemoryStats{

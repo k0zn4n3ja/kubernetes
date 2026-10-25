@@ -25,7 +25,7 @@ import (
 	evictionapi "k8s.io/kubernetes/pkg/kubelet/eviction/api"
 )
 
-func makeMemoryAvailableSignalObservation(logger klog.Logger, summary *statsapi.Summary) *signalObservation {
+func makeMemoryAvailableSignalObservation(logger klog.Logger, summary, _ *statsapi.Summary) *signalObservation {
 	logger.V(4).Info("Eviction manager: building memory signal observations for windows")
 	sysContainer, err := getSysContainer(summary.Node.SystemContainers, statsapi.SystemContainerWindowsGlobalCommitMemory)
 	if err != nil {

@@ -1600,6 +1600,12 @@
     lockToDefault: false
     preRelease: Alpha
     version: "1.11"
+- name: ReclaimAwareMemoryEviction
+  versionedSpecs:
+  - default: false
+    lockToDefault: false
+    preRelease: Alpha
+    version: "1.38"
 - name: RecoverVolumeExpansionFailure
   versionedSpecs:
   - default: false
